@@ -1,4 +1,4 @@
-# DirtyFrag-LPE — unprivileged SELinux Enforcing→Permissive + root (Quest 3 / 3S / Pro / 2)
+# DirtyFrag-LPE — unprivileged SELinux Enforcing→Permissive + root (Quest 3 / 3S / Pro / 2) roottoollinup
 
 > ### ✅ Patched — released for research/education
 > The underlying primitive, **DirtyFrag (CVE-2026-43284)** — an `rfc4106(gcm(aes))` ESP
